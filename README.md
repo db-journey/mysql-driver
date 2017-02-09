@@ -1,6 +1,6 @@
 # MySQL Driver
 
-### See [issue #1](https://github.com/gemnasium/migrate/issues/1#issuecomment-58728186) before using this driver!
+### See [issue #1](https://github.com/mattes/migrate/issues/1#issuecomment-58728186) before using this driver!
 
 * Runs migrations in transactions.
   That means that if a migration fails, it will be safely rolled back.
@@ -29,4 +29,4 @@ The MySQL driver will set a TLS config if the following env variables are set:
 
 ## Authors
 
-* Matthias Kadenbach, https://github.com/gemnasium
+* Matthias Kadenbach, https://github.com/mattes
