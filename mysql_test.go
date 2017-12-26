@@ -7,16 +7,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/db-journey/migrate/file"
 	"github.com/db-journey/migrate/direction"
-	pipep "github.com/db-journey/migrate/pipe"
+	"github.com/db-journey/migrate/file"
 )
 
 // TestMigrate runs some additional tests on Migrate().
 // Basic testing is already done in migrate_test.go
 func TestMigrate(t *testing.T) {
-	host := os.Getenv("MYSQL_PORT_3306_TCP_ADDR")
-	port := os.Getenv("MYSQL_PORT_3306_TCP_PORT")
+	host := getenvDefault("MYSQL_PORT_3306_TCP_ADDR", "localhost")
+	port := getenvDefault("MYSQL_PORT_3306_TCP_PORT", "3306")
 	driverURL := "mysql://root@tcp(" + host + ":" + port + ")/migratetest"
 
 	// prepare clean database
@@ -32,7 +31,7 @@ func TestMigrate(t *testing.T) {
 	dropTestTables(t, connection)
 
 	// Make an old-style 32-bit int version column that we'll have to upgrade.
-	_, err = connection.Exec("CREATE TABLE IF NOT EXISTS " + tableName + " (version int not null primary key);")
+	_, err = connection.Exec("CREATE TABLE IF NOT EXISTS " + versionsTableName + " (version int not null primary key);")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,11 +88,9 @@ func migrate(t *testing.T, driverURL string) {
 		},
 	}
 
-	pipe := pipep.New()
-	go d.Migrate(files[0], pipe)
-	errs := pipep.ReadErrors(pipe)
-	if len(errs) > 0 {
-		t.Fatal(errs)
+	err := d.Migrate(files[0])
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	version, err := d.Version()
@@ -112,17 +109,13 @@ func migrate(t *testing.T, driverURL string) {
 		t.Errorf("Could not fetch versions: %s", err)
 	}
 
-	pipe = pipep.New()
-	go d.Migrate(files[1], pipe)
-	errs = pipep.ReadErrors(pipe)
-	if len(errs) > 0 {
-		t.Fatal(errs)
+	err = d.Migrate(files[1])
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	pipe = pipep.New()
-	go d.Migrate(files[2], pipe)
-	errs = pipep.ReadErrors(pipe)
-	if len(errs) == 0 {
+	err = d.Migrate(files[2])
+	if err == nil {
 		t.Error("Expected test case to fail")
 	}
 
@@ -143,7 +136,15 @@ func migrate(t *testing.T, driverURL string) {
 }
 
 func dropTestTables(t *testing.T, db *sql.DB) {
-	if _, err := db.Exec(`DROP TABLE IF EXISTS yolo, yolo1, ` + tableName); err != nil {
+	if _, err := db.Exec(`DROP TABLE IF EXISTS yolo, yolo1, ` + versionsTableName); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func getenvDefault(varname, defaultValue string) string {
+	v := os.Getenv(varname)
+	if v == "" {
+		return defaultValue
+	}
+	return v
 }
