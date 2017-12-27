@@ -37,7 +37,8 @@ func init() {
 
 // Driver for MySQL
 type Driver struct {
-	db *sql.DB
+	db        *sql.DB
+	versionTx *sql.Tx
 }
 
 // Initialize driver
@@ -121,22 +122,9 @@ func (drv *Driver) Execute(sql string) error {
 // Migrate runs migration.
 // It locks schema_migrations table, so concurrent execution is safe.
 func (drv *Driver) Migrate(f file.File) error {
-	// NOTE: versionTx will be implicitly committed by LOCK TABLE
-	// the only reason we need it is to get exclusive db connection.
-	// TODO: go1.9 has DB.Conn() which returns exclusive connection, use it when time comes.
-	versionTx, err := drv.db.Begin()
-	if err != nil {
-		return err
+	if drv.versionTx == nil {
+		return errors.New("migrate must call Lock before Migrate")
 	}
-	_, err = versionTx.Exec("LOCK TABLES " + versionsTableName + " WRITE")
-	if err != nil {
-		return fmt.Errorf("failed to lock %s table: %v", versionsTableName, err)
-	}
-
-	// MySQL will unlock after closing connection anyway
-	// so possible error can be safely dismissed.
-	defer versionTx.Exec("UNLOCK TABLES")
-
 	if err := f.ReadContent(); err != nil {
 		return err
 	}
@@ -155,8 +143,8 @@ func (drv *Driver) Migrate(f file.File) error {
 	if f.Direction == direction.Down {
 		versionUpdSQL = "DELETE FROM " + versionsTableName + " WHERE version = ?"
 	}
-	if _, err = versionTx.Exec(versionUpdSQL, f.Version); err != nil {
-		versionTx.Rollback() // NOTE: we do not really care about possible error here.
+	if _, err = drv.versionTx.Exec(versionUpdSQL, f.Version); err != nil {
+		drv.rollbackVersionTx()
 		return err
 	}
 
@@ -166,7 +154,7 @@ func (drv *Driver) Migrate(f file.File) error {
 // Version returns the current migration version.
 func (drv *Driver) Version() (file.Version, error) {
 	var version file.Version
-	err := drv.db.QueryRow("SELECT version FROM " + versionsTableName + " ORDER BY version DESC").Scan(&version)
+	err := drv.versionTx.QueryRow("SELECT version FROM " + versionsTableName + " ORDER BY version DESC").Scan(&version)
 	switch {
 	case err == sql.ErrNoRows:
 		return 0, nil
@@ -181,7 +169,12 @@ func (drv *Driver) Version() (file.Version, error) {
 func (drv *Driver) Versions() (file.Versions, error) {
 	versions := file.Versions{}
 
-	rows, err := drv.db.Query("SELECT version FROM " + versionsTableName + " ORDER BY version DESC")
+	err := drv.initVersionTx()
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := drv.versionTx.Query("SELECT version FROM " + versionsTableName + " ORDER BY version DESC")
 	if err != nil {
 		return versions, err
 	}
@@ -198,6 +191,58 @@ func (drv *Driver) Versions() (file.Versions, error) {
 	return versions, err
 }
 
+// Lock schema_migrations table
+func (drv *Driver) Lock() error {
+	// NOTE: versionTx will be implicitly committed by LOCK TABLES
+	// the only reason we need it is to get exclusive db connection.
+	// TODO: go1.9 has DB.Conn() which returns exclusive connection, use it when time comes.
+	err := drv.initVersionTx()
+	if err != nil {
+		return err
+	}
+	_, err = drv.versionTx.Exec("LOCK TABLES " + versionsTableName + " WRITE")
+	if err != nil {
+		return fmt.Errorf("failed to lock %s table: %v", versionsTableName, err)
+	}
+	return nil
+}
+
+// Unlock schema_migrations table
+func (drv *Driver) Unlock() error {
+	if drv.versionTx == nil {
+		return errors.New("not locked")
+	}
+	_, err := drv.versionTx.Exec("UNLOCK TABLES")
+	if err != nil {
+		return fmt.Errorf("failed to unlock %s table: %v", versionsTableName, err)
+	}
+	err = drv.commitVersionTx()
+	return err
+}
+
+func (drv *Driver) initVersionTx() error {
+	if drv.versionTx == nil {
+		tx, err := drv.db.Begin()
+		if err != nil {
+			return err
+		}
+		drv.versionTx = tx
+	}
+	return nil
+}
+
+func (drv *Driver) commitVersionTx() error {
+	err := drv.versionTx.Commit()
+	drv.versionTx = nil
+	return err
+}
+
+func (drv *Driver) rollbackVersionTx() error {
+	err := drv.versionTx.Rollback()
+	drv.versionTx = nil
+	return err
+}
+
 func (drv *Driver) ensureVersionTableExists() error {
 	_, err := drv.db.Exec("CREATE TABLE IF NOT EXISTS " + versionsTableName + " (version bigint not null primary key);")
 	if err != nil {
@@ -206,7 +251,7 @@ func (drv *Driver) ensureVersionTableExists() error {
 
 	r := drv.db.QueryRow("SELECT data_type FROM information_schema.columns where table_name = ? and column_name = 'version'", versionsTableName)
 	dataType := ""
-	if err := r.Scan(&dataType); err != nil {
+	if err = r.Scan(&dataType); err != nil {
 		return err
 	}
 	if dataType != "int" {
