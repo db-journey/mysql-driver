@@ -274,9 +274,9 @@ type migrationSegment struct {
 }
 
 type migration struct {
-	// notx determines if default transaction
+	// noTx determines if default transaction
 	// should be disabled
-	notx     bool
+	noTx     bool
 	segments []migrationSegment
 }
 
@@ -307,10 +307,10 @@ func parseMigration(b []byte) (*migration, error) {
 		}
 		switch parseDirective(lines[i]) {
 		case directiveNotx:
-			m.notx = true
+			m.noTx = true
 			break
 		case directiveTxbegin:
-			m.notx = true
+			m.noTx = true
 			stmt.tx = true
 			stmt.txbegin = i + 1
 			for ; i < len(lines); i++ {
@@ -337,7 +337,7 @@ func (m migration) exec(db *sql.DB) (err error) {
 			tx.Rollback()
 		}
 	}()
-	if !m.notx {
+	if !m.noTx {
 		tx, err = db.Begin()
 		if err != nil {
 			return err
@@ -384,7 +384,7 @@ func stmtCommitErr(err error, s migrationSegment) error {
 	return fmt.Errorf("Failed to commit lines %d-%d: %s", s.txbegin, s.txend, err)
 }
 
-// newStmt is a DRYer for migration.parse
+// writeStmt is a DRYer for migration.parse
 // returns last line index of statement.
 func writeStmt(stmt *migrationSegment, lines [][]byte, i int) int {
 	i = scrollEmpty(lines, i)
