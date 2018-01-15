@@ -102,6 +102,9 @@ func Open(url string) (driver.Driver, error) {
 
 // Close db connection
 func (drv *Driver) Close() error {
+	if drv.versionConn != nil {
+		drv.versionConn.Close() // error is no big deal here.
+	}
 	return drv.db.Close()
 }
 
@@ -136,11 +139,9 @@ func (drv *Driver) Migrate(f file.File) error {
 		versionUpdSQL = "DELETE FROM " + versionsTableName + " WHERE version = ?"
 	}
 	if _, err = drv.versionConn.ExecContext(context.TODO(), versionUpdSQL, f.Version); err != nil {
-		drv.rollbackVersion()
-		return err
+		err = fmt.Errorf("migration %d was successfully applied, but failed to update schema_migrations table: %s", f.Version, err)
 	}
-
-	return nil
+	return err
 }
 
 // Version returns the current migration version.
@@ -193,10 +194,6 @@ func (drv *Driver) Lock() error {
 	if err != nil {
 		return fmt.Errorf("failed to lock %s table: %v", versionsTableName, err)
 	}
-	_, err = drv.versionConn.ExecContext(context.TODO(), "BEGIN;")
-	if err != nil {
-		return fmt.Errorf("failed to lock %s table: %v", versionsTableName, err)
-	}
 	return nil
 }
 
@@ -209,28 +206,15 @@ func (drv *Driver) Unlock() error {
 	if err != nil {
 		return fmt.Errorf("failed to unlock %s table: %v", versionsTableName, err)
 	}
-	err = drv.commitVersion()
+	drv.versionConn.Close() // not a big deal if it fails to return connection to the pool
+	drv.versionConn = nil
 	return err
 }
 
 func (drv *Driver) initVersionConn() (err error) {
-	if drv.versionConn != nil {
-		return nil
+	if drv.versionConn == nil {
+		drv.versionConn, err = drv.db.Conn(context.TODO())
 	}
-	drv.versionConn, err = drv.db.Conn(context.TODO())
-	return
-}
-
-func (drv *Driver) commitVersion() error {
-	_, err := drv.versionConn.ExecContext(context.TODO(), "COMMIT;")
-	drv.versionConn.Close()
-	drv.versionConn = nil
-	return err
-}
-
-func (drv *Driver) rollbackVersion() error {
-	_, err := drv.versionConn.ExecContext(context.TODO(), "ROLLBACK;")
-	drv.versionConn = nil
 	return err
 }
 
