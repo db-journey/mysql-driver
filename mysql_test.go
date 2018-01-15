@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/db-journey/migrate/direction"
+	"github.com/db-journey/migrate/driver"
 	"github.com/db-journey/migrate/file"
 )
 
@@ -40,8 +41,9 @@ func TestMigrate(t *testing.T) {
 }
 
 func migrate(t *testing.T, driverURL string) {
-	d := &Driver{}
-	if err := d.Initialize(driverURL); err != nil {
+	var err error
+	var d driver.Driver
+	if d, err = Open(driverURL); err != nil {
 		t.Fatal(err)
 	}
 
@@ -88,8 +90,8 @@ func migrate(t *testing.T, driverURL string) {
 		},
 	}
 
-	d.Lock()
-	err := d.Migrate(files[0])
+	driver.Lock(d)
+	err = d.Migrate(files[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +104,7 @@ func migrate(t *testing.T, driverURL string) {
 	if version != 20060102150405 {
 		t.Errorf("Expected version to be: %d, got: %d", 20060102150405, version)
 	}
-	d.Unlock()
+	driver.Unlock(d)
 
 	// Check versions applied in DB
 	expectedVersions := file.Versions{20060102150405}
@@ -111,28 +113,28 @@ func migrate(t *testing.T, driverURL string) {
 		t.Errorf("Could not fetch versions: %s", err)
 	}
 
-	d.Lock()
+	driver.Lock(d)
 	err = d.Migrate(files[1])
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.Unlock()
+	driver.Unlock(d)
 
-	d.Lock()
+	driver.Lock(d)
 	err = d.Migrate(files[2])
 	if err == nil {
 		t.Error("Expected test case to fail")
 	}
-	d.Unlock()
+	driver.Unlock(d)
 
 	// Check versions applied in DB
-	d.Lock()
+	driver.Lock(d)
 	expectedVersions = file.Versions{}
 	versions, err = d.Versions()
 	if err != nil {
 		t.Errorf("Could not fetch versions: %s", err)
 	}
-	d.Unlock()
+	driver.Unlock(d)
 
 	if !reflect.DeepEqual(versions, expectedVersions) {
 		t.Errorf("Expected versions to be: %v, got: %v", expectedVersions, versions)

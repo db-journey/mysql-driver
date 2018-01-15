@@ -3,6 +3,7 @@ package mysql
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -28,24 +29,39 @@ const (
 	directiveNoop    = ""
 )
 
-// make sure our driver still implements the driver.Driver interface
-var _ driver.Driver = (*Driver)(nil)
+var fileTemplate = []byte(`
+-- Each SQL statement MUST end with semicolon (;) FOLLOWED BY NEWLINE !
+-- Whole migration will be executed inside transaction by default.
+-- Place SQL between "-- TXBEGIN" and "-- TXEND" comments for custom transaction:
+--   - you CAN have multiple separate transactions in single migration
+--   - any SQL not wrapped into TXBEGIN - TXEND will be executed without transaction.
+-- Add "-- NOTX" comment above all SQL to disable default migration. NOTE:
+--   it's redundant when TXBEGIN/TXEND is used.
+`)
+
+type factory struct{}
+
+func (f factory) New(url string) (driver.Driver, error) {
+	return Open(url)
+}
 
 func init() {
-	driver.RegisterDriver("mysql", &Driver{})
+	driver.Register("mysql", "sql", fileTemplate, factory{})
 }
 
 // Driver for MySQL
 type Driver struct {
-	db        *sql.DB
-	versionTx *sql.Tx
+	db          *sql.DB
+	versionConn *sql.Conn
 }
 
-// Initialize driver
-func (drv *Driver) Initialize(url string) error {
+// Open driver
+func Open(url string) (driver.Driver, error) {
+	drv := &Driver{}
+
 	urlWithoutScheme := strings.SplitN(url, "mysql://", 2)
 	if len(urlWithoutScheme) != 2 {
-		return errors.New("invalid mysql:// scheme")
+		return nil, errors.New("invalid mysql:// scheme")
 	}
 
 	// check if env vars vor mysql ssl connection are set and if yes use them
@@ -55,17 +71,17 @@ func (drv *Driver) Initialize(url string) error {
 		rootCertPool := x509.NewCertPool()
 		pem, err := ioutil.ReadFile(os.Getenv("MYSQL_SERVER_CA"))
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		if ok := rootCertPool.AppendCertsFromPEM(pem); !ok {
-			return errors.New("Failed to append PEM")
+			return nil, errors.New("Failed to append PEM")
 		}
 
 		clientCert := make([]tls.Certificate, 0, 1)
 		certs, err := tls.LoadX509KeyPair(os.Getenv("MYSQL_CLIENT_CERT"), os.Getenv("MYSQL_CLIENT_KEY"))
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		clientCert = append(clientCert, certs)
@@ -80,37 +96,19 @@ func (drv *Driver) Initialize(url string) error {
 
 	db, err := sql.Open("mysql", urlWithoutScheme[1])
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := db.Ping(); err != nil {
-		return err
+		return nil, err
 	}
 	drv.db = db
 
-	return drv.ensureVersionTableExists()
+	return drv, drv.ensureVersionTableExists()
 }
 
 // Close db connection
 func (drv *Driver) Close() error {
 	return drv.db.Close()
-}
-
-// FilenameExtension of migration file.
-func (drv *Driver) FilenameExtension() string {
-	return "sql"
-}
-
-// FileTemplate of migration file.
-func (drv *Driver) FileTemplate() []byte {
-	return []byte(`
--- Each SQL statement MUST end with semicolon (;) FOLLOWED BY NEWLINE !
--- Whole migration will be executed inside transaction by default.
--- Place SQL between "-- TXBEGIN" and "-- TXEND" comments for custom transaction:
---   - you CAN have multiple separate transactions in single migration
---   - any SQL not wrapped into TXBEGIN - TXEND will be executed without transaction.
--- Add "-- NOTX" comment above all SQL to disable default migration. NOTE:
---   it's redundant when TXBEGIN/TXEND is used.
-`)
 }
 
 // Execute sql
@@ -122,7 +120,7 @@ func (drv *Driver) Execute(sql string) error {
 // Migrate runs migration.
 // It locks schema_migrations table, so concurrent execution is safe.
 func (drv *Driver) Migrate(f file.File) error {
-	if drv.versionTx == nil {
+	if drv.versionConn == nil {
 		return errors.New("migrate must call Lock before Migrate")
 	}
 	if err := f.ReadContent(); err != nil {
@@ -143,8 +141,8 @@ func (drv *Driver) Migrate(f file.File) error {
 	if f.Direction == direction.Down {
 		versionUpdSQL = "DELETE FROM " + versionsTableName + " WHERE version = ?"
 	}
-	if _, err = drv.versionTx.Exec(versionUpdSQL, f.Version); err != nil {
-		drv.rollbackVersionTx()
+	if _, err = drv.versionConn.ExecContext(context.TODO(), versionUpdSQL, f.Version); err != nil {
+		drv.rollbackVersion()
 		return err
 	}
 
@@ -154,7 +152,7 @@ func (drv *Driver) Migrate(f file.File) error {
 // Version returns the current migration version.
 func (drv *Driver) Version() (file.Version, error) {
 	var version file.Version
-	err := drv.versionTx.QueryRow("SELECT version FROM " + versionsTableName + " ORDER BY version DESC").Scan(&version)
+	err := drv.versionConn.QueryRowContext(context.TODO(), "SELECT version FROM "+versionsTableName+" ORDER BY version DESC").Scan(&version)
 	switch {
 	case err == sql.ErrNoRows:
 		return 0, nil
@@ -169,12 +167,12 @@ func (drv *Driver) Version() (file.Version, error) {
 func (drv *Driver) Versions() (file.Versions, error) {
 	versions := file.Versions{}
 
-	err := drv.initVersionTx()
+	err := drv.initVersionConn()
 	if err != nil {
 		return nil, err
 	}
 
-	rows, err := drv.versionTx.Query("SELECT version FROM " + versionsTableName + " ORDER BY version DESC")
+	rows, err := drv.versionConn.QueryContext(context.TODO(), "SELECT version FROM "+versionsTableName+" ORDER BY version DESC")
 	if err != nil {
 		return versions, err
 	}
@@ -193,14 +191,15 @@ func (drv *Driver) Versions() (file.Versions, error) {
 
 // Lock schema_migrations table
 func (drv *Driver) Lock() error {
-	// NOTE: versionTx will be implicitly committed by LOCK TABLES
-	// the only reason we need it is to get exclusive db connection.
-	// TODO: go1.9 has DB.Conn() which returns exclusive connection, use it when time comes.
-	err := drv.initVersionTx()
+	err := drv.initVersionConn()
 	if err != nil {
 		return err
 	}
-	_, err = drv.versionTx.Exec("LOCK TABLES " + versionsTableName + " WRITE")
+	_, err = drv.versionConn.ExecContext(context.TODO(), "LOCK TABLES "+versionsTableName+" WRITE")
+	if err != nil {
+		return fmt.Errorf("failed to lock %s table: %v", versionsTableName, err)
+	}
+	_, err = drv.versionConn.ExecContext(context.TODO(), "BEGIN;")
 	if err != nil {
 		return fmt.Errorf("failed to lock %s table: %v", versionsTableName, err)
 	}
@@ -209,37 +208,35 @@ func (drv *Driver) Lock() error {
 
 // Unlock schema_migrations table
 func (drv *Driver) Unlock() error {
-	if drv.versionTx == nil {
+	if drv.versionConn == nil {
 		return errors.New("not locked")
 	}
-	_, err := drv.versionTx.Exec("UNLOCK TABLES")
+	_, err := drv.versionConn.ExecContext(context.TODO(), "UNLOCK TABLES")
 	if err != nil {
 		return fmt.Errorf("failed to unlock %s table: %v", versionsTableName, err)
 	}
-	err = drv.commitVersionTx()
+	err = drv.commitVersion()
 	return err
 }
 
-func (drv *Driver) initVersionTx() error {
-	if drv.versionTx == nil {
-		tx, err := drv.db.Begin()
-		if err != nil {
-			return err
-		}
-		drv.versionTx = tx
+func (drv *Driver) initVersionConn() (err error) {
+	if drv.versionConn != nil {
+		return nil
 	}
-	return nil
+	drv.versionConn, err = drv.db.Conn(context.TODO())
+	return
 }
 
-func (drv *Driver) commitVersionTx() error {
-	err := drv.versionTx.Commit()
-	drv.versionTx = nil
+func (drv *Driver) commitVersion() error {
+	_, err := drv.versionConn.ExecContext(context.TODO(), "COMMIT;")
+	drv.versionConn.Close()
+	drv.versionConn = nil
 	return err
 }
 
-func (drv *Driver) rollbackVersionTx() error {
-	err := drv.versionTx.Rollback()
-	drv.versionTx = nil
+func (drv *Driver) rollbackVersion() error {
+	_, err := drv.versionConn.ExecContext(context.TODO(), "ROLLBACK;")
+	drv.versionConn = nil
 	return err
 }
 
