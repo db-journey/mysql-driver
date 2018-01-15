@@ -39,14 +39,8 @@ var fileTemplate = []byte(`
 --   it's redundant when TXBEGIN/TXEND is used.
 `)
 
-type factory struct{}
-
-func (f factory) New(url string) (driver.Driver, error) {
-	return Open(url)
-}
-
 func init() {
-	driver.Register("mysql", "sql", fileTemplate, factory{})
+	driver.Register("mysql", "sql", fileTemplate, Open)
 }
 
 // Driver for MySQL
